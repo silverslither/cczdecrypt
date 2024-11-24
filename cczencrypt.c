@@ -53,7 +53,7 @@ void initKey(void) {
     } while (--rounds);
 }
 
-void decryptCCZ(u32 *data, u32 len) {
+void encryptCCZ(u32 *data, u32 len) {
     static const u32 securelen = 512;
     static const u32 distance = 64;
 
@@ -87,30 +87,35 @@ u32 checksumCCZ(u32 *data, u32 len) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--help") == 0) {
-        printf("Usage: cczdecrypt <infile> <key> [options]\n"
-               "Decrypt Cocos2d encrypted CCZ `file` with given `key`.\n"
+        printf("Usage: cczencrypt <infile> <key> [options]\n"
+               "Encrypt `file` with Cocos2d encryption algorithm, with given `key`.\n"
                "`infile` can be absolute or relative to cwd.\n"
                "`key` must be 32 hexadecimal digits.\n"
-               "Example: cczdecrypt data.pvr.ccz 83c1e28613d11f53ead45ea59da9fca3\n\n"
+               "Example: cczencrypt data.pvr 83c1e28613d11f53ead45ea59da9fca3\n\n"
                "Additional options:\n"
                "  -o[outfile]                   Write output to `outfile` instead of default\n"
-               "  -i, --ignore-checksum         Bypass CCZ checksum check\n");
+               "  -c[compression_level]         zlib compression level (default: 6)\n"
+               "  -s, --skip-checksum           Do not write CCZ checksum\n");
         return 0;
     }
 
-    assert(argc >= 3, "Usage: cczdecrypt <file> <key> [options]\nType cczdecrypt --help for more information.\n");
+    assert(argc >= 3, "Usage: cczencrypt <file> <key> [options]\nType cczencrypt --help for more information.\n");
 
     u32 i;
     u8 checksum = 1;
     char *outfile = NULL;
 
+    int compression_level = 6;
+
     for (i = 3; i < (u32)argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--ignore-checksum") == 0) {
+        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--skip-checksum") == 0) {
             checksum = 0;
         } else if (argv[i][0] == '-' && argv[i][1] == 'o') {
             outfile = argv[i] + 2;
+        } else if (argv[i][0] == '-' && argv[i][1] == 'c') {
+            assert(sscanf(argv[i] + 2, "%d", &compression_level), "Error parsing zlib compression level.\n");
         } else {
-            fprintf(stderr, "Unrecognized argument %s.", argv[i]);
+            fprintf(stderr, "Unrecognized argument %s.\n", argv[i]);
             return 1;
         }
     }
@@ -152,88 +157,47 @@ int main(int argc, char **argv) {
     assert(!ferror(infp), "File read error.\n");
     fclose(infp);
 
-    assert(len > HEADER_SIZE, "Invalid CCZ file.\n");
+    struct libdeflate_compressor *compressor = libdeflate_alloc_compressor(compression_level);
+    assert(compressor, "Compressor allocation failed.\n");
 
-    struct CCZHeader *header = (struct CCZHeader *)buf;
-    assert(header->sig[0] == 'C' && header->sig[1] == 'C' && header->sig[2] == 'Z', "Invalid CCZ file.");
-
-    decryptCCZ((u32 *)(buf + ENCRYPTED_OFFSET), (len - ENCRYPTED_OFFSET) >> 2);
-    assert(
-        !checksum || checksumCCZ((u32 *)(buf + ENCRYPTED_OFFSET), (len - ENCRYPTED_OFFSET) >> 2) == header->checksum,
-        "Checksum mismatch, check that your key is correct.\n"
-    );
-
-    u8 *out = malloc(header->len);
+    u32 outlen = libdeflate_zlib_compress_bound(compressor, len);
+    u8 *out = malloc(outlen + HEADER_SIZE);
     assert(out, "Memory allocation failed.\n");
 
-    struct libdeflate_decompressor *decompressor = libdeflate_alloc_decompressor();
-    assert(decompressor, "Decompressor allocation failed.\n");
+    struct CCZHeader *header = (struct CCZHeader *)out;
+    header->sig[0] = 'C';
+    header->sig[1] = 'C';
+    header->sig[2] = 'Z';
+    header->sig[3] = 'p';
+    header->compression_type = 0;
+    header->version = 0;
+    header->len = len;
 
-    int zerr = libdeflate_zlib_decompress(decompressor, buf + HEADER_SIZE, len - HEADER_SIZE, out, header->len, NULL);
-    switch (zerr) {
-    case LIBDEFLATE_BAD_DATA:
-        fprintf(stderr, "libdeflate error LIBDEFLATE_BAD_DATA.\n");
-        return 1;
-    case LIBDEFLATE_SHORT_OUTPUT:
-        fprintf(stderr, "libdeflate error LIBDEFLATE_SHORT_OUTPUT.\n");
-        return 1;
-    case LIBDEFLATE_INSUFFICIENT_SPACE:
-        fprintf(stderr, "libdeflate error LIBDEFLATE_INSUFFICIENT_SPACE.\n");
-        return 1;
-    }
+    outlen = libdeflate_zlib_compress(compressor, buf, len, out + HEADER_SIZE, outlen);
+    assert(outlen, "libdeflate_zlib_compress returned 0 (error).\n");
+
+    if (checksum && checksumCCZ((u32 *)(out + ENCRYPTED_OFFSET), (outlen >> 2) + 1))
+        header->checksum = checksumCCZ((u32 *)(out + ENCRYPTED_OFFSET), (outlen >> 2) + 1);
+    encryptCCZ((u32 *)(out + ENCRYPTED_OFFSET), (outlen >> 2) + 1);
 
     if (outfile) {
         argv[1] = outfile;
     } else {
-        i = l;
-
-        while (i > 0 && argv[1][i - 1] != '/' && argv[1][i - 1] != '\\')
-            i--;
-
-        if ((argv[1][l - 1] == 'z' || argv[1][l - 1] == 'Z') && (argv[1][l - 2] == 'c' || argv[1][l - 2] == 'C') && (argv[1][l - 3] == 'c' || argv[1][l - 3] == 'C') && argv[1][l - 4] == '.') {
-            l = l - 4;
-#ifdef _WIN32
-            while (l > i && (argv[1][l - 1] == '.' || argv[1][l - 1] == ' '))
-                l--;
-#endif
-            if (l > i) {
-                argv[1][l] = 0;
-            } else {
-                char *outf = malloc(i + 11);
-                assert(outf, "Memory allocation failed.\n");
-
-                memcpy(outf, argv[1], i);
-                memcpy(outf + i, "decrypted_", 11);
-
-                argv[1] = outf;
-            }
-        } else {
-            char *outf = malloc(l + 11);
-            assert(outf, "Memory allocation failed.\n");
-
-            while (i > 0 && argv[1][i] != '/' && argv[1][i] != '\\')
-                i--;
-
-            i++;
-            if (i == 1 && (argv[1][i] == '/' || argv[1][i] == '\\'))
-                i = 0;
-
-            memcpy(outf, argv[1], i);
-            memcpy(outf + i, "decrypted_", 10);
-            memcpy(outf + i + 10, argv[1] + i, l - i + 1);
-            argv[1] = outf;
-        }
+        char *outf = malloc(l + 4);
+        memcpy(outf, argv[1], l);
+        memcpy(outf + l, ".ccz", 5);
+        argv[1] = outf;
     }
 
     FILE *outfp = fopen(argv[1], "wb");
 
     assert(
-        outfp && fwrite(out, 1, header->len, outfp) >= header->len && !ferror(outfp),
+        outfp && fwrite(out, 1, outlen + HEADER_SIZE, outfp) >= outlen + HEADER_SIZE && !ferror(outfp),
         "File write error.\n"
     );
 
     fclose(outfp);
-    printf("Wrote decrypted file to %s.\n", argv[1]);
+    printf("Wrote encrypted file to %s.\n", argv[1]);
 
     return 0;
 }
